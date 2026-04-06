@@ -455,9 +455,10 @@ class JournalApp(ctk.CTk):
         self.verification: str | None = None
 
         self._build_layout()
-        self._initialize_passphrase_and_records()
-        self._refresh_sidebar()
         self._show_blank_state()
+        
+        # Schedule passphrase initialization and sidebar refresh after window is displayed
+        self.after(100, self._delayed_initialization)
 
     def _build_layout(self) -> None:
         self.grid_columnconfigure(1, weight=1)
@@ -685,6 +686,11 @@ class JournalApp(ctk.CTk):
 
     def _on_search_change(self, *_args: object) -> None:
         self._refresh_sidebar()
+    
+    def _delayed_initialization(self) -> None:
+        """Initialize passphrase first, then refresh sidebar with correct keys."""
+        self._initialize_passphrase_and_records()
+        self._refresh_sidebar()
 
     def _filtered_records(self) -> list[JournalRecord]:
         query = self.search_var.get().strip().lower()
@@ -881,71 +887,8 @@ class JournalApp(ctk.CTk):
         self.records = []
     
     def _prompt_for_passphrase(self, title: str, prompt: str) -> str | None:
-        """Show a dialog to prompt for passphrase."""
-        dialog = ctk.CTk()
-        dialog.title(title)
-        dialog.geometry("400x200")
-        dialog.configure(fg_color=APP_BG)
-        dialog.resizable(False, False)
-        
-        # Center on screen
-        dialog.update_idletasks()
-        
-        frame = ctk.CTkFrame(dialog, fg_color=PANEL_BG)
-        frame.pack(fill="both", expand=True, padx=20, pady=20)
-        
-        label = ctk.CTkLabel(frame, text=prompt, text_color=TEXT, font=ctk.CTkFont(size=13))
-        label.pack(pady=(0, 10))
-        
-        entry = ctk.CTkEntry(
-            frame,
-            show="•",
-            height=40,
-            fg_color=PANEL_ALT,
-            border_color=CARD_BORDER,
-            text_color=TEXT,
-        )
-        entry.pack(fill="x", pady=(0, 15))
-        entry.focus_set()
-        
-        result = {"value": None}
-        
-        def on_ok() -> None:
-            result["value"] = entry.get()
-            dialog.destroy()
-        
-        def on_cancel() -> None:
-            dialog.destroy()
-        
-        button_frame = ctk.CTkFrame(frame, fg_color="transparent")
-        button_frame.pack(fill="x")
-        
-        ok_button = ctk.CTkButton(
-            button_frame,
-            text="OK",
-            height=36,
-            fg_color=ACCENT,
-            hover_color=ACCENT_HOVER,
-            text_color=TEXT,
-            command=on_ok,
-        )
-        ok_button.pack(side="left", padx=(0, 10), fill="x", expand=True)
-        
-        cancel_button = ctk.CTkButton(
-            button_frame,
-            text="Cancel",
-            height=36,
-            fg_color="transparent",
-            hover_color="#1f2a33",
-            border_width=1,
-            border_color=CARD_BORDER,
-            text_color=TEXT,
-            command=on_cancel,
-        )
-        cancel_button.pack(side="left", fill="x", expand=True)
-        
-        dialog.wait_window()
-        return result["value"] if result["value"] else None
+        """Show a dialog to prompt for passphrase using tkinter simpledialog."""
+        return simpledialog.askstring(title, prompt, show="•")
     
     def _setup_new_journal_with_passphrase(self) -> None:
         """Set up passphrase for a new journal."""
