@@ -5,13 +5,16 @@ import shutil
 import re
 import sys
 import uuid
+import os
+import hashlib
+import hmac
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import simpledialog, messagebox
 
 try:
     import customtkinter as ctk
@@ -23,7 +26,15 @@ except ImportError as exc:  # pragma: no cover - import guard for runtime depend
 
 PLAYFAIR_KEY = "SECRET"
 XOR_KEY = "SUPERSECRETKEY"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.1.0"
+
+# ============= Passphrase-based Key Derivation =============
+PBKDF2_ITERATIONS = 100000
+SALT_SIZE = 32
+VERIFICATION_TOKEN = "SECURE_JOURNAL_VERIFICATION"
+GLOBAL_PLAYFAIR_KEY = None
+GLOBAL_XOR_KEY = None
+GLOBAL_PASSPHRASE = None
 
 
 def _app_data_file() -> Path:
@@ -86,6 +97,73 @@ class JournalRecord:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
+
+
+def _now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+# ============= Key Derivation Functions =============
+def generate_salt() -> str:
+    """Generate a cryptographic salt for PBKDF2."""
+    return os.urandom(SALT_SIZE).hex()
+
+
+def derive_keys_from_passphrase(passphrase: str, salt: str) -> tuple[str, str, str]:
+    """
+    Derive two encryption keys from a passphrase using PBKDF2.
+    
+    Returns:
+        (playfair_key, xor_key, verification_token)
+    """
+    if not passphrase or not salt:
+        raise ValueError("Passphrase and salt cannot be empty")
+    
+    # Derive a master key from passphrase
+    salt_bytes = bytes.fromhex(salt)
+    master_key = hashlib.pbkdf2_hmac(
+        "sha256",
+        passphrase.encode("utf-8"),
+        salt_bytes,
+        PBKDF2_ITERATIONS
+    )
+    
+    # Derive two separate keys from master key
+    playfair_key = hashlib.sha256(master_key + b"playfair").hexdigest()[:26]
+    xor_key = hashlib.sha256(master_key + b"xor_cipher").hexdigest()[:30]
+    
+    # Generate verification token
+    verification = hmac.new(master_key, VERIFICATION_TOKEN.encode(), hashlib.sha256).hexdigest()
+    
+    return playfair_key, xor_key, verification
+
+
+def verify_passphrase(passphrase: str, salt: str, stored_verification: str) -> bool:
+    """Verify that the passphrase matches the stored verification token."""
+    try:
+        _, _, verification = derive_keys_from_passphrase(passphrase, salt)
+        return hmac.compare_digest(verification, stored_verification)
+    except (ValueError, TypeError):
+        return False
+
+
+def set_global_keys(passphrase: str, salt: str) -> None:
+    """Set global encryption keys derived from passphrase."""
+    global GLOBAL_PLAYFAIR_KEY, GLOBAL_XOR_KEY, GLOBAL_PASSPHRASE
+    playfair_key, xor_key, _ = derive_keys_from_passphrase(passphrase, salt)
+    GLOBAL_PLAYFAIR_KEY = playfair_key
+    GLOBAL_XOR_KEY = xor_key
+    GLOBAL_PASSPHRASE = passphrase
+
+
+def get_playfair_key() -> str:
+    """Get the current Playfair key (derived or fallback)."""
+    return GLOBAL_PLAYFAIR_KEY if GLOBAL_PLAYFAIR_KEY else PLAYFAIR_KEY
+
+
+def get_xor_key() -> str:
+    """Get the current XOR key (derived or fallback)."""
+    return GLOBAL_XOR_KEY if GLOBAL_XOR_KEY else XOR_KEY
 
 
 def _now_iso() -> str:
@@ -188,7 +266,8 @@ def _remove_playfair_padding(text: str) -> str:
 def _transform_playfair_text(text: str, encrypt: bool) -> str:
     if not text:
         return ""
-    square, positions = _build_playfair_square(PLAYFAIR_KEY)
+    key = get_playfair_key()
+    square, positions = _build_playfair_square(key)
     output: list[str] = []
     for segment in re.findall(r"[A-Za-z]+|[^A-Za-z]+", text):
         if not segment.isalpha():
@@ -225,7 +304,8 @@ def _xor_bytes(payload: bytes, key: bytes) -> bytes:
 def xor_encrypt_hex(text: str) -> str:
     if not text:
         return ""
-    encrypted = _xor_bytes(text.encode("utf-8"), XOR_KEY.encode("utf-8"))
+    key = get_xor_key()
+    encrypted = _xor_bytes(text.encode("utf-8"), key.encode("utf-8"))
     return encrypted.hex()
 
 
@@ -236,7 +316,8 @@ def xor_decrypt_hex(hex_text: str) -> str:
         encrypted = bytes.fromhex(hex_text)
     except ValueError:
         return ""
-    decrypted = _xor_bytes(encrypted, XOR_KEY.encode("utf-8"))
+    key = get_xor_key()
+    decrypted = _xor_bytes(encrypted, key.encode("utf-8"))
     return decrypted.decode("utf-8", errors="replace")
 
 
@@ -283,27 +364,50 @@ def load_records(path: Path = DATA_FILE) -> list[JournalRecord]:
     return _sort_records(records)
 
 
-def load_records_detailed(path: Path = DATA_FILE) -> tuple[list[JournalRecord], str | None]:
+def load_records_detailed(path: Path = DATA_FILE) -> tuple[list[JournalRecord], str | None, str | None, str | None]:
+    """Load records with metadata. Returns (records, error_code, salt, verification)."""
     if not path.exists():
-        return [], None
+        return [], None, None, None
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
-        return [], "json_decode_error"
+        return [], "json_decode_error", None, None
     except OSError:
-        return [], "read_error"
+        return [], "read_error", None, None
 
+    salt = None
+    verification = None
+    
+    # Handle both old format (list) and new format (dict with metadata)
     if isinstance(raw, dict):
+        salt = raw.get("salt")
+        verification = raw.get("verification")
         raw = raw.get("entries", [])
+    
     if not isinstance(raw, list):
-        return [], "invalid_shape"
+        return [], "invalid_shape", None, None
 
     records = [record for item in raw if (record := JournalRecord.from_dict(item)) is not None]
-    return _sort_records(records), None
+    return _sort_records(records), None, salt, verification
 
 
-def save_records(records: list[JournalRecord], path: Path = DATA_FILE) -> None:
-    payload = json.dumps([record.to_dict() for record in _sort_records(records)], indent=2)
+def save_records(records: list[JournalRecord], path: Path = DATA_FILE, salt: str | None = None, verification: str | None = None) -> None:
+    """Save records with optional metadata (salt, verification token)."""
+    sorted_records = _sort_records(records)
+    
+    # Create payload with optional metadata
+    if salt and verification:
+        payload_dict = {
+            "version": "1.1",
+            "salt": salt,
+            "verification": verification,
+            "entries": [record.to_dict() for record in sorted_records]
+        }
+    else:
+        # Fallback to list-only format for backward compatibility
+        payload_dict = [record.to_dict() for record in sorted_records]
+    
+    payload = json.dumps(payload_dict, indent=2)
     backup = _backup_path(path)
     temp_path = path.with_suffix(path.suffix + ".tmp")
 
@@ -347,9 +451,11 @@ class JournalApp(ctk.CTk):
         self.mode: str = "view"
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", self._on_search_change)
+        self.salt: str | None = None
+        self.verification: str | None = None
 
         self._build_layout()
-        self._initialize_records_with_recovery()
+        self._initialize_passphrase_and_records()
         self._refresh_sidebar()
         self._show_blank_state()
 
@@ -561,7 +667,7 @@ class JournalApp(ctk.CTk):
 
         footer_legend = ctk.CTkLabel(
             footer,
-            text="Playfair: title, tags, mood   |   XOR: content",
+            text="Keys derived from passphrase   |   Playfair: title, tags, mood   |   XOR: content",
             text_color=TEXT_MUTED,
             font=ctk.CTkFont(size=11),
         )
@@ -697,10 +803,220 @@ class JournalApp(ctk.CTk):
         self._refresh_sidebar()
         self.status_label.configure(text=f"Storage: {DATA_FILE.name}")
 
+    def _initialize_passphrase_and_records(self) -> None:
+        """Initialize passphrase and load records."""
+        records, error_code, salt, verification = load_records_detailed(DATA_FILE)
+        
+        # Check if journal already has passphrase protection
+        if salt and verification:
+            # Existing journal with passphrase - prompt for passphrase
+            passphrase = self._prompt_for_passphrase("Enter Passphrase", "Enter your journal passphrase:")
+            if passphrase is None:
+                messagebox.showwarning("Secure Journal", "No passphrase provided. Starting with empty view.")
+                self.records = []
+                return
+            
+            if not verify_passphrase(passphrase, salt, verification):
+                messagebox.showerror("Secure Journal", "Incorrect passphrase. Cannot load journal.")
+                self.records = []
+                return
+            
+            set_global_keys(passphrase, salt)
+            self.salt = salt
+            self.verification = verification
+            
+            if error_code is None:
+                self.records = records
+                return
+        else:
+            # New journal or legacy journal - offer setup
+            if error_code is None and records:
+                # Legacy journal exists with data - offer to protect with passphrase
+                setup = messagebox.askyesno(
+                    "Secure Journal",
+                    "Your journal appears to be using legacy encryption.\n\nWould you like to set up passphrase protection now?",
+                )
+                if setup:
+                    self._setup_passphrase_for_existing_journal(records)
+                    return
+                else:
+                    self.records = records
+                    return
+            elif error_code is None and not records:
+                # New empty journal - offer passphrase setup
+                setup = messagebox.askyesno(
+                    "Secure Journal",
+                    "Set up passphrase protection for your journal?",
+                )
+                if setup:
+                    self._setup_new_journal_with_passphrase()
+                    return
+                self.records = []
+                return
+        
+        # Handle errors
+        if error_code in {"json_decode_error", "invalid_shape"}:
+            should_restore = messagebox.askyesno(
+                "Secure Journal",
+                "Journal data looks corrupted or invalid. Restore from backup if available?",
+            )
+            if should_restore and restore_from_backup(DATA_FILE):
+                restored_records, restored_error, res_salt, res_verification = load_records_detailed(DATA_FILE)
+                if restored_error is None:
+                    self.records = restored_records
+                    self.salt = res_salt
+                    self.verification = res_verification
+                    if res_salt and res_verification:
+                        passphrase = self._prompt_for_passphrase("Restore Passphrase", "Enter your journal passphrase:")
+                        if passphrase and verify_passphrase(passphrase, res_salt, res_verification):
+                            set_global_keys(passphrase, res_salt)
+                    messagebox.showinfo("Secure Journal", "Backup restored successfully.")
+                    return
+                messagebox.showwarning("Secure Journal", "Backup exists but could not be loaded.")
+            else:
+                messagebox.showwarning("Secure Journal", "Starting with an empty in-memory journal view.")
+        elif error_code == "read_error":
+            messagebox.showwarning("Secure Journal", "Could not read journal data. Starting with an empty in-memory journal view.")
+
+        self.records = []
+    
+    def _prompt_for_passphrase(self, title: str, prompt: str) -> str | None:
+        """Show a dialog to prompt for passphrase."""
+        dialog = ctk.CTk()
+        dialog.title(title)
+        dialog.geometry("400x200")
+        dialog.configure(fg_color=APP_BG)
+        dialog.resizable(False, False)
+        
+        # Center on screen
+        dialog.update_idletasks()
+        
+        frame = ctk.CTkFrame(dialog, fg_color=PANEL_BG)
+        frame.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        label = ctk.CTkLabel(frame, text=prompt, text_color=TEXT, font=ctk.CTkFont(size=13))
+        label.pack(pady=(0, 10))
+        
+        entry = ctk.CTkEntry(
+            frame,
+            show="•",
+            height=40,
+            fg_color=PANEL_ALT,
+            border_color=CARD_BORDER,
+            text_color=TEXT,
+        )
+        entry.pack(fill="x", pady=(0, 15))
+        entry.focus_set()
+        
+        result = {"value": None}
+        
+        def on_ok() -> None:
+            result["value"] = entry.get()
+            dialog.destroy()
+        
+        def on_cancel() -> None:
+            dialog.destroy()
+        
+        button_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        button_frame.pack(fill="x")
+        
+        ok_button = ctk.CTkButton(
+            button_frame,
+            text="OK",
+            height=36,
+            fg_color=ACCENT,
+            hover_color=ACCENT_HOVER,
+            text_color=TEXT,
+            command=on_ok,
+        )
+        ok_button.pack(side="left", padx=(0, 10), fill="x", expand=True)
+        
+        cancel_button = ctk.CTkButton(
+            button_frame,
+            text="Cancel",
+            height=36,
+            fg_color="transparent",
+            hover_color="#1f2a33",
+            border_width=1,
+            border_color=CARD_BORDER,
+            text_color=TEXT,
+            command=on_cancel,
+        )
+        cancel_button.pack(side="left", fill="x", expand=True)
+        
+        dialog.wait_window()
+        return result["value"] if result["value"] else None
+    
+    def _setup_new_journal_with_passphrase(self) -> None:
+        """Set up passphrase for a new journal."""
+        passphrase = self._prompt_for_passphrase("Set Passphrase", "Create a passphrase (min 6 chars):")
+        if not passphrase:
+            messagebox.showwarning("Secure Journal", "Passphrase setup cancelled. Using hardcoded keys.")
+            return
+        
+        if len(passphrase) < 6:
+            messagebox.showwarning("Secure Journal", "Passphrase too short. Minimum 6 characters. Using hardcoded keys.")
+            return
+        
+        # Generate salt and set keys
+        self.salt = generate_salt()
+        _, _, verification = derive_keys_from_passphrase(passphrase, self.salt)
+        self.verification = verification
+        set_global_keys(passphrase, self.salt)
+        
+        self.records = []
+        messagebox.showinfo("Secure Journal", "Passphrase protection enabled successfully!")
+    
+    def _setup_passphrase_for_existing_journal(self, records: list[JournalRecord]) -> None:
+        """Upgrade existing journal to use passphrase protection."""
+        passphrase = self._prompt_for_passphrase("Set Passphrase", "Create a passphrase (min 6 chars):")
+        if not passphrase:
+            messagebox.showwarning("Secure Journal", "Setup cancelled.")
+            self.records = records
+            return
+        
+        if len(passphrase) < 6:
+            messagebox.showwarning("Secure Journal", "Passphrase too short. Minimum 6 characters.")
+            self.records = records
+            return
+        
+        # Generate salt and re-encrypt all records
+        self.salt = generate_salt()
+        _, _, verification = derive_keys_from_passphrase(passphrase, self.salt)
+        self.verification = verification
+        set_global_keys(passphrase, self.salt)
+        
+        # Re-encrypt all records with new keys
+        re_encrypted = []
+        for record in records:
+            # Decrypt with old keys
+            decrypted = decrypt_record_fields(record)
+            # Re-encrypt with new keys
+            new_record = encrypt_record_fields(
+                decrypted["title"],
+                decrypted["tags"],
+                decrypted["mood"],
+                decrypted["content"],
+                record_id=record.id,
+                created_at=record.created_at
+            )
+            re_encrypted.append(new_record)
+        
+        self.records = re_encrypted
+        
+        try:
+            save_records(self.records, DATA_FILE, self.salt, self.verification)
+            messagebox.showinfo("Secure Journal", "Journal upgraded to passphrase protection!")
+        except OSError as exc:
+            messagebox.showerror("Secure Journal", f"Could not save protected journal:\n{exc}")
+    
     def _initialize_records_with_recovery(self) -> None:
-        records, error_code = load_records_detailed(DATA_FILE)
+        """Legacy method - kept for backward compatibility."""
+        records, error_code, salt, verification = load_records_detailed(DATA_FILE)
         if error_code is None:
             self.records = records
+            self.salt = salt
+            self.verification = verification
             return
 
         if error_code in {"json_decode_error", "invalid_shape"}:
@@ -709,9 +1025,11 @@ class JournalApp(ctk.CTk):
                 "Journal data looks corrupted or invalid. Restore from backup if available?",
             )
             if should_restore and restore_from_backup(DATA_FILE):
-                restored_records, restored_error = load_records_detailed(DATA_FILE)
+                restored_records, restored_error, res_salt, res_verification = load_records_detailed(DATA_FILE)
                 if restored_error is None:
                     self.records = restored_records
+                    self.salt = res_salt
+                    self.verification = res_verification
                     messagebox.showinfo("Secure Journal", "Backup restored successfully.")
                     return
                 messagebox.showwarning("Secure Journal", "Backup exists but could not be loaded.")
@@ -822,7 +1140,7 @@ class JournalApp(ctk.CTk):
         self.records.append(record)
         self.records = _sort_records(self.records)
         try:
-            save_records(self.records)
+            save_records(self.records, DATA_FILE, self.salt, self.verification)
         except OSError as exc:
             messagebox.showerror("Secure Journal", f"Could not save journal data:\n{exc}")
             return
@@ -846,7 +1164,7 @@ class JournalApp(ctk.CTk):
 
         self.records = [item for item in self.records if item.id != record.id]
         try:
-            save_records(self.records)
+            save_records(self.records, DATA_FILE, self.salt, self.verification)
         except OSError as exc:
             messagebox.showerror("Secure Journal", f"Could not delete journal data:\n{exc}")
             return

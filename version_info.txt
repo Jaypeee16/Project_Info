@@ -3,8 +3,8 @@
 # https://docs.microsoft.com/en-us/windows/win32/menurc/versioninfo-resource
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 0, 1, 0),
-    prodvers=(1, 0, 1, 0),
+    filevers=(1, 1, 0, 0),
+    prodvers=(1, 1, 0, 0),
     mask=0x3F,
     flags=0x0,
     OS=0x40004,
@@ -17,13 +17,13 @@ VSVersionInfo(
       StringTable(
         '040904B0',
         [StringStruct('CompanyName', 'Secure Journal'),
-        StringStruct('FileDescription', 'Secure Journal Application'),
-        StringStruct('FileVersion', '1.0.1.0'),
+        StringStruct('FileDescription', 'Secure Journal Application - Passphrase Protected'),
+        StringStruct('FileVersion', '1.1.0.0'),
         StringStruct('InternalName', 'SecureJournal'),
         StringStruct('LegalCopyright', 'Copyright (c) 2026'),
         StringStruct('OriginalFilename', 'SecureJournal.exe'),
         StringStruct('ProductName', 'Secure Journal Application'),
-        StringStruct('ProductVersion', '1.0.1.0')])
+        StringStruct('ProductVersion', '1.1.0.0')])
       ]),
     VarFileInfo([VarStruct('Translation', [1033, 1200])])
   ]
